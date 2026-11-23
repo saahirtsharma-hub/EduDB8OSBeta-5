@@ -1,0 +1,57 @@
+name: Build XFCE Proxy OS ISO
+on:
+  workflow_dispatch:
+    inputs:
+      custom_kernel:
+        description: "Also build and use the custom 6.12 kernel (slow, experimental)"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+
+jobs:
+  kernel:
+    if: ${{ inputs.custom_kernel }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build kernel .deb packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc dwarves cpio kmod rsync debhelper
+          curl -sL https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz | tar xJ
+          cd linux-6.12
+          make x86_64_defconfig
+          scripts/kconfig/merge_config.sh -m .config ../kernel/distro.fragment
+          make olddefconfig
+          make -j"$(nproc)" bindeb-pkg
+          cd ..
+          rm -f linux-image-*-dbg_*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-debs
+          path: linux-image-*.deb
+
+  iso:
+    needs: [kernel]
+    if: ${{ always() && (needs.kernel.result == 'success' || needs.kernel.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+      options: --privileged
+    steps:
+      - run: apt-get update && apt-get install -y git ca-certificates
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        if: ${{ needs.kernel.result == 'success' }}
+        with:
+          name: kernel-debs
+          path: kernel
+      - name: Build ISO
+        run: |
+          chmod +x scripts/*.sh live-build/auto/config live-build/config/hooks/normal/* live-build/config/includes.chroot/usr/local/bin/*
+          ./scripts/build-iso.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xfceproxy-os-iso
+          path: live-build/*.iso
