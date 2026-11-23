@@ -1,0 +1,12 @@
+set $mod Mod4
+default_border none
+font pango:Noto Sans 11
+output * bg #2323ff solid_color
+floating_modifier $mod normal
+for_window [app_id="xshell"] fullscreen enable
+bindsym $mod+Home workspace number 1
+bindsym $mod+q kill
+bindsym $mod+Shift+Escape exec sudo -n systemctl poweroff --force --force
+bindsym $mod+Return exec foot
+exec udiskie --automount --no-notify
+exec /usr/local/bin/xshell-start

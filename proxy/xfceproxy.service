@@ -1,0 +1,16 @@
+[Unit]
+Description=XFCE Proxy OS built-in proxy and webapp host
+After=network.target
+
+[Service]
+User=xfceproxy
+ExecStart=/usr/bin/python3 /usr/local/bin/xproxy
+Restart=on-failure
+LogsDirectory=xfceproxy
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

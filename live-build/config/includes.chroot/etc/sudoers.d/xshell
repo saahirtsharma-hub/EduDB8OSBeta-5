@@ -1,0 +1,2 @@
+# The desktop shell runs these admin commands without a password (apps, updates, power-off, installer).
+%sudo ALL=(root) NOPASSWD: /usr/bin/apt-get, /usr/bin/install, /usr/bin/systemctl, /usr/sbin/chpasswd, /usr/bin/env, /usr/bin/sh, /bin/sh

@@ -1,0 +1,649 @@
+#!/usr/bin/env python3
+"""xshelld - serves the shell UI on 127.0.0.1:8081 and exposes launch + .deb store APIs.
+Every POST needs the per-boot token (only the shell page contains it), the exact Origin and Host."""
+import configparser, getpass, glob, hashlib, io, json, math, os, re, secrets, signal, subprocess, sys, tarfile, tempfile, threading, time, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+WEB = os.environ.get("XSHELL_WEB", "/usr/share/xshell")
+PORT = int(os.environ.get("XSHELL_PORT", "8081"))
+TOKEN = secrets.token_hex(16)
+PKG = re.compile(r"^[a-z0-9][a-z0-9+.\-]{1,100}$")
+QRY = re.compile(r"^[A-Za-z0-9+.\- ]{2,40}$")
+REPO = "saahirtsharma-hub/EduDB8OSBeta-3"
+try:
+    REPO = open("/etc/xshell/repo").read().strip() or REPO
+except OSError:
+    pass
+BRANCH = "main"
+INC = "live-build/config/includes.chroot/"
+TARBALL = os.environ.get("XSHELL_TARBALL") or f"https://codeload.github.com/{REPO}/tar.gz/refs/heads/{BRANCH}"
+VERFILE = os.environ.get("XSHELL_VERSION_URL") or f"https://raw.githubusercontent.com/{REPO}/{BRANCH}/{INC}usr/share/xshell/VERSION"
+ROOT = os.environ.get("XSHELL_UPDATE_ROOT", "")
+SEG = re.compile(r"^[A-Za-z0-9._-]+$")
+LOCK = threading.Lock()
+VER_DEST = "/usr/share/xshell/VERSION"
+CMDS = {"foot": ["foot"], "files": ["pcmanfm"]}
+URL = re.compile(r"^https?://[^\s]+$")
+ACC = os.environ.get("XSHELL_ACC", os.path.expanduser("~/.config/xshell/account.json"))
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,29}$")
+TERM_EXEC = {"foot", "xterm", "uxterm", "lxterm", "lxterminal", "xfce4-terminal", "gnome-terminal", "konsole", "kitty", "alacritty",
+             "urxvt", "rxvt", "st", "terminator", "tilix", "sakura", "qterminal", "mate-terminal", "x-terminal-emulator"}
+SKIP_DESK = {"calamares.desktop", "install-debian.desktop"}
+EDU_PKGS = {"gcompris-qt": "GCompris: more than 100 learning games", "tuxpaint": "Tux Paint: drawing for kids",
+            "tuxmath": "Tux Math: arcade-style math", "tuxtype": "Tux Typing: learn to type", "supertux": "SuperTux: platform game"}
+EDU_MIN = 45
+EDUCFG = os.environ.get("XSHELL_EDUCFG", os.path.expanduser("~/.config/xshell/edu.json"))
+PREFS = os.environ.get("XSHELL_PREFS", os.path.expanduser("~/.config/xshell/prefs.json"))
+NOTES = os.environ.get("XSHELL_NOTES", os.path.expanduser("~/Documents/notes.txt"))
+PICS = os.environ.get("XSHELL_PICS", os.path.expanduser("~/Pictures"))
+SITE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
+USAGE = os.environ.get("XSHELL_USAGE", os.path.expanduser("~/.config/xshell/usage.json"))
+PROTECT = (b"xshelld", b"xproxy", b"sway", b"xshell", b"calamares")
+_prev, _cpu = {}, (0, 0)
+
+
+def load_acc():
+    try:
+        with open(ACC) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def hash_pw(pw, salt):
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200000).hex()
+
+
+def local_ver():
+    try:
+        with open(os.path.join(WEB, "VERSION")) as f:
+            return int(f.read().strip())
+    except Exception:
+        return 0
+
+
+def fetch(url, cap):
+    with urllib.request.urlopen(url, timeout=20) as r:
+        return r.read(cap)
+
+
+def remote_ver():
+    try:
+        return int(fetch(VERFILE, 64).decode().strip())
+    except Exception:
+        return None
+
+
+def target(rel):
+    """Map a path inside includes.chroot to (destination, mode); None if it may not be updated."""
+    fixed = {"usr/local/bin/xshell-ui": 0o755, VER_DEST[1:]: 0o644,
+             "usr/local/bin/xshelld": 0o755, "usr/local/bin/xproxy": 0o755, "etc/xfceproxy/proxy.conf": 0o644,
+             "usr/share/xshell/policies/work.json": 0o644, "usr/share/xshell/policies/edu.json": 0o644,
+             "usr/local/bin/xshell-shot": 0o755, "usr/share/xshell/packages.txt": 0o644}
+    if rel in fixed:
+        return "/" + rel, fixed[rel]
+    parts = rel.split("/")
+    if rel.startswith("usr/share/xfceproxy/webapps/") and len(parts) >= 6 and all(SEG.match(x) and x not in (".", "..") for x in parts):
+        return "/" + rel, 0o644
+    return None
+
+
+def put(dest, data, mode):
+    if ROOT:
+        p = ROOT + dest
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(data)
+        os.chmod(p, mode)
+        return
+    with tempfile.NamedTemporaryFile(delete=False) as t:
+        t.write(data)
+    try:
+        subprocess.run(["sudo", "-n", "install", "-D", "-m", oct(mode)[2:], t.name, dest], check=True, capture_output=True)
+    finally:
+        os.unlink(t.name)
+
+
+def restart():
+    if not ROOT:
+        subprocess.run(["sudo", "-n", "systemctl", "restart", "xfceproxy"], capture_output=True)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def do_update():
+    with LOCK:
+        rv = remote_ver()
+        if rv is None:
+            return {"ok": False, "msg": "Could not reach the update server. Is the repo public?"}
+        if rv <= local_ver():
+            return {"ok": True, "version": local_ver(), "msg": "Already up to date."}
+        files = {}
+        with tarfile.open(fileobj=io.BytesIO(fetch(TARBALL, 60 * 2**20)), mode="r:gz") as t:
+            for m in t.getmembers():
+                if not m.isfile() or m.size > 5 * 2**20:
+                    continue
+                path = m.name.partition("/")[2]
+                tg = target(path[len(INC):]) if path.startswith(INC) else None
+                if tg:
+                    files[tg[0]] = (t.extractfile(m).read(), tg[1])
+        if "/usr/local/bin/xshell-ui" not in files or VER_DEST not in files:
+            return {"ok": False, "msg": "Update package is incomplete."}
+        try:
+            for py in ("/usr/local/bin/xshelld", "/usr/local/bin/xproxy", "/usr/local/bin/xshell-ui"):
+                if py in files:
+                    compile(files[py][0].decode(), py, "exec")
+            new = int(files[VER_DEST][0].decode().strip())
+        except Exception:
+            return {"ok": False, "msg": "Update failed its safety checks. Nothing was changed."}
+        if new <= local_ver():
+            return {"ok": False, "msg": "Update package has an old version number."}
+        for dest, (data, mode) in files.items():
+            if dest != VER_DEST:
+                put(dest, data, mode)
+        pk = files.get("/usr/share/xshell/packages.txt")
+        if pk and not ROOT:   # updates may bring new packages (sound, screenshots, ...)
+            want = [x for x in pk[0].decode().split() if PKG.match(x)]
+            missing = [x for x in want if subprocess.run(["dpkg", "-s", x], capture_output=True).returncode != 0]
+            if missing:
+                subprocess.run(["sudo", "-n", "apt-get", "update"], capture_output=True, timeout=600)
+                subprocess.run(["sudo", "-n", "apt-get", "install", "-y", "--", *missing], capture_output=True, timeout=1800)
+                subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+                subprocess.run(["systemctl", "--user", "start", "pipewire", "pipewire-pulse", "wireplumber"], capture_output=True)
+        put(VER_DEST, files[VER_DEST][0], 0o644)
+        threading.Timer(1.0, restart).start()
+        return {"ok": True, "version": new, "msg": "Updated."}
+
+
+def kill():
+    try:
+        subprocess.run(["sync"], timeout=2)
+    except Exception:
+        pass
+    subprocess.run(["sudo", "-n", "systemctl", "poweroff", "--force", "--force"], capture_output=True)
+    subprocess.run(["sudo", "-n", "sh", "-c", "echo o > /proc/sysrq-trigger"], capture_output=True)
+
+
+def apps():
+    out, edu = {}, mode() == "edu"
+    for f in glob.glob("/usr/share/applications/*.desktop") + glob.glob(os.path.expanduser("~/.local/share/applications/*.desktop")):
+        c = configparser.RawConfigParser(strict=False, interpolation=None)
+        try:
+            c.read(f, encoding="utf-8")
+            s = c["Desktop Entry"]
+            if s.get("Type") != "Application" or s.get("NoDisplay", "").lower() == "true" or s.get("Hidden", "").lower() == "true":
+                continue
+            cats = s.get("Categories", "")
+            exe = os.path.basename((s.get("Exec", "").split() or [""])[0])
+            if os.path.basename(f) in SKIP_DESK or (edu and (s.get("Terminal", "").lower() == "true" or exe in TERM_EXEC
+                                                             or "TerminalEmulator" in cats or "System" in cats or "Settings" in cats)):
+                continue
+            out[os.path.basename(f)] = {"id": os.path.basename(f), "name": s.get("Name", os.path.basename(f))}
+        except Exception:
+            continue
+    return sorted(out.values(), key=lambda a: a["name"].lower())
+
+
+def save_acc(a):
+    os.makedirs(os.path.dirname(ACC), exist_ok=True)
+    with os.fdopen(os.open(ACC, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(a, f)
+
+
+def mode():
+    a = load_acc()
+    return a.get("mode", "work") if a else "work"
+
+
+def apply_mode(m):
+    """Switch Firefox policy, proxy allow-list and the terminal shortcut to match the mode."""
+    if os.environ.get("XSHELL_NO_APPLY") or m not in ("work", "edu"):
+        return
+    for cmd in (["sudo", "-n", "install", "-D", "-m", "644", f"/usr/share/xshell/policies/{m}.json", "/usr/lib/firefox-esr/distribution/policies.json"],
+                ["sudo", "-n", "sh", "-c", f"echo {m} > /etc/xfceproxy/mode"],
+                ["swaymsg", "unbindsym Mod4+Return" if m == "edu" else "bindsym Mod4+Return exec foot"]):
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=20)
+        except Exception:
+            pass
+
+
+def sway_tree():
+    try:
+        return json.loads(subprocess.run(["swaymsg", "-t", "get_tree"], capture_output=True, text=True, timeout=3).stdout)
+    except Exception:
+        return None
+
+
+def windows():
+    out = []
+
+    def walk(n):
+        wp = n.get("window_properties") or {}
+        if n.get("pid") and (n.get("app_id") or wp):
+            out.append({"pid": n["pid"], "app": n.get("app_id") or wp.get("class", ""), "name": n.get("name") or "", "focused": bool(n.get("focused"))})
+        for k in n.get("nodes", []) + n.get("floating_nodes", []):
+            walk(k)
+
+    walk(sway_tree() or {})
+    return out
+
+
+def is_shell(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return b"xshell" in f.read()
+    except Exception:
+        return False
+
+
+def usage():
+    try:
+        with open(USAGE) as f:
+            u = json.load(f)
+    except Exception:
+        u = {}
+    today = time.strftime("%Y-%m-%d")
+    return u if u.get("date") == today else {"date": today, "sec": 0}
+
+
+def save_usage(u):
+    os.makedirs(os.path.dirname(USAGE), exist_ok=True)
+    with open(USAGE, "w") as f:
+        json.dump(u, f)
+
+
+def edu_loop():
+    """EDU Mode: count the time a Firefox window is the focused window, close Firefox after 45 minutes a day."""
+    last = time.time()
+    while True:
+        time.sleep(5)
+        now = time.time()
+        dt, last = min(now - last, 15), now
+        if mode() != "edu":
+            continue
+        ff = [w for w in windows() if w["app"].lower().startswith("firefox") and not is_shell(w["pid"])]
+        u = usage()
+        if u["sec"] < edu_limit() * 60 and any(w["focused"] for w in ff):
+            u["sec"] += dt
+            save_usage(u)
+        if u["sec"] >= edu_limit() * 60:
+            for w in ff:
+                try:
+                    os.kill(w["pid"], signal.SIGTERM)
+                except Exception:
+                    pass
+
+
+def rss_mb(pid):
+    try:
+        with open(f"/proc/{pid}/statm") as f:
+            return round(int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**20, 1)
+    except Exception:
+        return 0.0
+
+
+def sys_stats():
+    global _cpu
+    with open("/proc/stat") as f:
+        v = list(map(int, f.readline().split()[1:]))
+    idle, tot = v[3] + v[4], sum(v)
+    pi, pt = _cpu
+    _cpu = (idle, tot)
+    cpu = 0.0 if not pt or tot == pt else round(100 * (1 - (idle - pi) / (tot - pt)), 1)
+    mi = {}
+    with open("/proc/meminfo") as f:
+        for ln in f:
+            k, _, rest = ln.partition(":")
+            mi[k] = int(rest.split()[0]) if rest.split() else 0
+    return cpu, (mi["MemTotal"] - mi["MemAvailable"]) // 1024, mi["MemTotal"] // 1024
+
+
+def proc_rows():
+    global _prev
+    now, hz, uid, cur, rows = time.time(), os.sysconf("SC_CLK_TCK"), os.getuid(), {}, []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+            with open(f"/proc/{pid}/stat") as f:
+                st = f.read()
+            fl = st[st.rindex(")") + 2:].split()
+            name = st[st.index("(") + 1:st.rindex(")")]
+            ticks = int(fl[11]) + int(fl[12])
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read()
+        except Exception:
+            continue
+        cur[pid] = (ticks, now)
+        pv = _prev.get(pid)
+        cpu = round(max(0.0, (ticks - pv[0]) / hz / max(now - pv[1], 0.001) * 100), 1) if pv else 0.0
+        rows.append({"pid": int(pid), "name": name, "cpu": cpu, "mem": rss_mb(pid), "locked": int(pid) <= 1 or any(x in cmd for x in PROTECT)})
+    _prev = cur
+    rows.sort(key=lambda r: (-r["cpu"], -r["mem"]))
+    return rows[:25]
+
+
+def tasks_info(edu):
+    cpu, used, total = sys_stats()
+    if edu:   # kids only see their open apps
+        rows = [{"pid": w["pid"], "name": w["app"] or w["name"], "cpu": 0, "mem": rss_mb(w["pid"]), "locked": False}
+                for w in windows() if not is_shell(w["pid"])]
+    else:
+        rows = proc_rows()
+    return {"cpu": cpu, "used": used, "total": total, "rows": rows, "edu": edu}
+
+
+def end_task(pid, edu):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read()
+        if pid <= 1 or os.stat(f"/proc/{pid}").st_uid != os.getuid() or any(x in cmd for x in PROTECT):
+            return False
+        if edu and pid not in {w["pid"] for w in windows()}:
+            return False
+        os.kill(pid, signal.SIGTERM)
+    except Exception:
+        return False
+
+    def hard():
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                if f.read() == cmd:
+                    os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+    threading.Timer(3.0, hard).start()
+    return True
+
+
+def jload(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def jsave(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(obj, f)
+
+
+def edu_limit():
+    try:
+        return max(5, min(180, int(jload(EDUCFG, {}).get("limit", EDU_MIN))))
+    except Exception:
+        return EDU_MIN
+
+
+def run(cmd, timeout=15):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+
+
+def wifi_list():
+    r = run(["nmcli", "-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY", "device", "wifi", "list"], 20)
+    seen = {}
+    for ln in (r.stdout.splitlines() if r and r.returncode == 0 else []):
+        parts = re.split(r"(?<!\\):", ln)
+        if len(parts) < 4 or not parts[1]:
+            continue
+        n = {"ssid": parts[1].replace("\\:", ":"), "signal": int(parts[2] or 0), "secure": parts[3] not in ("", "--"), "active": parts[0] == "*"}
+        if n["ssid"] not in seen or n["signal"] > seen[n["ssid"]]["signal"]:
+            seen[n["ssid"]] = n
+    return sorted(seen.values(), key=lambda n: -n["signal"])[:15]
+
+
+def wifi_connect(ssid, pw):
+    if not 1 <= len(ssid) <= 32 or ssid.startswith("-") or len(pw) > 63 or any(ord(c) < 32 for c in ssid + pw):
+        return False
+    r = run(["nmcli", "device", "wifi", "connect", ssid] + (["password", pw] if pw else []), 45)
+    return bool(r and r.returncode == 0)
+
+
+def volume(setv=None):
+    if setv is not None:
+        run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{max(0, min(100, int(setv))) / 100:.2f}"])
+    r = run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
+    m = re.search(r"([0-9.]+)", r.stdout) if r and r.returncode == 0 else None
+    return round(float(m.group(1)) * 100) if m else None
+
+
+def brightness(setv=None):
+    if setv is not None:
+        run(["brightnessctl", "set", f"{max(5, min(100, int(setv)))}%"])
+    r = run(["brightnessctl", "-m"])
+    m = re.search(r",(\d+)%", r.stdout) if r and r.returncode == 0 else None
+    return int(m.group(1)) if m else None
+
+
+def bind_keys():
+    for b in ("Print exec /usr/local/bin/xshell-shot", "XF86AudioRaiseVolume exec wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+",
+              "XF86AudioLowerVolume exec wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-", "XF86AudioMute exec wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle",
+              "XF86MonBrightnessUp exec brightnessctl set 5%+", "XF86MonBrightnessDown exec brightnessctl set 5%-"):
+        run(["swaymsg", "bindsym " + b])
+
+
+def parent_action(action, value):
+    cfg = jload(EDUCFG, {})
+    sites = [x for x in cfg.get("sites", []) if isinstance(x, str)]
+    if action == "limit":
+        cfg["limit"] = max(5, min(180, int(value)))
+    elif action in ("add", "remove"):
+        v = str(value).strip().lower()
+        v = v[4:] if v.startswith("www.") else v
+        if action == "add":
+            if not SITE.match(v):
+                return False
+            if v not in sites:
+                sites.append(v)
+        else:
+            sites = [x for x in sites if x != v]
+        cfg["sites"] = sites[:50]
+        put("/etc/xfceproxy/extra-allow", ("\n".join(cfg["sites"]) + "\n").encode(), 0o644)
+    elif action != "get":
+        return False
+    jsave(EDUCFG, cfg)
+    return True
+
+
+def spawn(cmd):
+    try:
+        subprocess.run(["swaymsg", "workspace", "number", "2"], capture_output=True)
+    except FileNotFoundError:
+        pass
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    except OSError:
+        return False
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def out(self, code, body, ctype="application/json"):
+        b = body if isinstance(body, bytes) else json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_GET(self):
+        if self.path == "/health":
+            return self.out(200, {"ok": True})
+        self.out(404, {"error": "not found"})
+
+    def do_POST(self):
+        h = self.headers
+        if (h.get("Host") != f"127.0.0.1:{PORT}" or h.get("Origin") != f"http://127.0.0.1:{PORT}"
+                or not secrets.compare_digest(h.get("X-Token", ""), TOKEN)):
+            return self.out(403, {"error": "forbidden"})
+        try:
+            d = json.loads(self.rfile.read(min(int(h.get("Content-Length", 0)), 200000)) or b"{}")
+        except Exception:
+            return self.out(400, {"error": "bad request"})
+        p = self.path
+        if p == "/api/account":
+            a = load_acc()
+            return self.out(200, {"name": a["name"] if a else None, "mode": a.get("mode", "work") if a else "work", "live": os.path.isdir("/run/live/medium")})
+        if p == "/api/setup":
+            name, pw = str(d.get("name", "")).strip(), str(d.get("password", ""))
+            if load_acc() or not NAME.match(name) or not 4 <= len(pw) <= 128 or any(c in pw for c in "\r\n\0"):
+                return self.out(400, {"ok": False})
+            md = d.get("mode", "work")
+            if md not in ("work", "edu"):
+                return self.out(400, {"ok": False})
+            salt = secrets.token_hex(16)
+            save_acc({"name": name, "mode": md, "salt": salt, "hash": hash_pw(pw, salt)})
+            apply_mode(md)
+            if not os.environ.get("XSHELL_NO_CHPASSWD"):
+                subprocess.run(["sudo", "-n", "chpasswd"], input=f"{getpass.getuser()}:{pw}\n", text=True, capture_output=True)
+            return self.out(200, {"ok": True})
+        if p == "/api/login":
+            a = load_acc()
+            ok = bool(a) and secrets.compare_digest(hash_pw(str(d.get("password", "")), a["salt"]), a["hash"])
+            if not ok:
+                time.sleep(1)
+            return self.out(200, {"ok": ok})
+        if p == "/api/update/check":
+            lv, rv = local_ver(), remote_ver()
+            return self.out(200, {"local": lv, "remote": rv, "available": rv is not None and rv > lv})
+        if p == "/api/update/install":
+            try:
+                return self.out(200, do_update())
+            except Exception as e:
+                return self.out(200, {"ok": False, "msg": "Update failed: " + str(e)[:80]})
+        if p == "/api/kill":
+            self.out(200, {"ok": True})
+            if not os.environ.get("XSHELL_DRY"):
+                kill()
+            return
+        if p == "/api/apps":
+            return self.out(200, apps())
+        if p == "/api/launch":
+            edu = mode() == "edu"
+            if d.get("cmd") == "install":
+                if edu or not os.path.isdir("/run/live/medium"):
+                    return self.out(200, {"ok": False, "msg": "The installer is only available in Work Mode from the live USB."})
+                env = [f"XDG_RUNTIME_DIR={os.environ.get('XDG_RUNTIME_DIR', '/run/user/1000')}",
+                       f"WAYLAND_DISPLAY={os.environ.get('WAYLAND_DISPLAY', 'wayland-1')}", "QT_QPA_PLATFORM=wayland"]
+                ok = spawn(["sudo", "-n", "env", *env, "calamares"])
+            elif d.get("cmd") in CMDS and not (edu and d["cmd"] == "foot"):
+                ok = spawn(CMDS[d["cmd"]])
+            elif d.get("id") in {a["id"] for a in apps()}:
+                ok = spawn(["gtk-launch", d["id"]])
+            elif "url" in d and (d["url"] == "" or URL.match(d["url"])):
+                if edu and usage()["sec"] >= edu_limit() * 60:
+                    return self.out(200, {"ok": False, "msg": "Firefox time is up for today."})
+                ok = spawn(["firefox-esr", "--new-window", d["url"] or "http://home.app.local/"])
+            else:
+                return self.out(400, {"error": "bad target"})
+            return self.out(200, {"ok": ok})
+        if p == "/api/refresh":
+            r = subprocess.run(["sudo", "-n", "apt-get", "update"], capture_output=True, text=True, timeout=300)
+            return self.out(200, {"ok": r.returncode == 0})
+        if p == "/api/search":
+            q = str(d.get("q", "")).strip()
+            if mode() == "edu":   # kids can only browse the approved list
+                return self.out(200, [{"name": n, "desc": t} for n, t in EDU_PKGS.items() if q.lower() in (n + t).lower()])
+            if not QRY.match(q):
+                return self.out(200, [])
+            r = subprocess.run(["apt-cache", "search", *q.split()], capture_output=True, text=True, timeout=60)
+            res = []
+            for ln in r.stdout.splitlines()[:25]:
+                n, _, desc = ln.partition(" - ")
+                res.append({"name": n, "desc": desc})
+            return self.out(200, res)
+        if p == "/api/install":
+            pkg = str(d.get("pkg", ""))
+            if not PKG.match(pkg) or (mode() == "edu" and pkg not in EDU_PKGS):
+                return self.out(400, {"ok": False})
+            r = subprocess.run(["sudo", "-n", "apt-get", "install", "-y", "--", pkg], capture_output=True, text=True, timeout=1800)
+            return self.out(200, {"ok": r.returncode == 0, "log": r.stdout[-400:] + r.stderr[-400:]})
+        if p == "/api/mode":
+            a, m = load_acc(), d.get("mode")
+            if not a or m not in ("work", "edu") or not secrets.compare_digest(hash_pw(str(d.get("password", "")), a["salt"]), a["hash"]):
+                time.sleep(1)
+                return self.out(200, {"ok": False})
+            a["mode"] = m
+            save_acc(a)
+            apply_mode(m)
+            return self.out(200, {"ok": True})
+        if p == "/api/edu":
+            left = max(0, math.ceil((edu_limit() * 60 - usage()["sec"]) / 60))
+            return self.out(200, {"mode": mode(), "limit": edu_limit(), "left": left})
+        if p == "/api/tasks":
+            return self.out(200, tasks_info(mode() == "edu"))
+        if p == "/api/tasks/end":
+            try:
+                ok = end_task(int(d.get("pid", 0)), mode() == "edu")
+            except (TypeError, ValueError):
+                ok = False
+            return self.out(200, {"ok": ok})
+        if p == "/api/wifi/list":
+            return self.out(200, wifi_list())
+        if p == "/api/wifi/connect":
+            return self.out(200, {"ok": wifi_connect(str(d.get("ssid", "")), str(d.get("password", "")))})
+        if p in ("/api/volume", "/api/brightness"):
+            try:
+                v = (volume if p == "/api/volume" else brightness)(d.get("set"))
+            except (TypeError, ValueError):
+                v = None
+            return self.out(200, {"value": v})
+        if p == "/api/prefs":
+            return self.out(200, jload(PREFS, {}))
+        if p == "/api/prefs/set":
+            w = d.get("wallpaper")
+            if isinstance(w, int) and 0 <= w <= 4:
+                pr = jload(PREFS, {})
+                pr["wallpaper"] = w
+                jsave(PREFS, pr)
+                return self.out(200, {"ok": True})
+            return self.out(400, {"ok": False})
+        if p == "/api/notes":
+            try:
+                with open(NOTES, encoding="utf-8") as f:
+                    return self.out(200, {"text": f.read()})
+            except OSError:
+                return self.out(200, {"text": ""})
+        if p == "/api/notes/save":
+            os.makedirs(os.path.dirname(NOTES), exist_ok=True)
+            with open(NOTES, "w", encoding="utf-8") as f:
+                f.write(str(d.get("text", ""))[:100000])
+            return self.out(200, {"ok": True})
+        if p == "/api/screenshot":
+            os.makedirs(PICS, exist_ok=True)
+            r = run(["grim", os.path.join(PICS, time.strftime("screenshot-%Y%m%d-%H%M%S.png"))], 20)
+            return self.out(200, {"ok": bool(r and r.returncode == 0)})
+        if p == "/api/parent":
+            a = load_acc()
+            if mode() != "edu" or not a or not secrets.compare_digest(hash_pw(str(d.get("password", "")), a["salt"]), a["hash"]):
+                time.sleep(1)
+                return self.out(200, {"ok": False})
+            try:
+                ok = parent_action(str(d.get("action", "")), d.get("value"))
+            except Exception:
+                ok = False
+            return self.out(200, {"ok": ok, "limit": edu_limit(), "used": int(usage()["sec"] // 60), "sites": jload(EDUCFG, {}).get("sites", [])})
+        self.out(404, {"error": "not found"})
+
+
+if __name__ == "__main__":
+    tp = os.environ.get("XSHELL_TOKEN", os.path.expanduser("~/.cache/xshell/token"))
+    os.makedirs(os.path.dirname(tp), mode=0o700, exist_ok=True)
+    with os.fdopen(os.open(tp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        f.write(TOKEN)
+    if load_acc():
+        apply_mode(mode())
+    if not os.environ.get("XSHELL_NO_APPLY"):
+        bind_keys()
+    threading.Thread(target=edu_loop, daemon=True).start()
+    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()

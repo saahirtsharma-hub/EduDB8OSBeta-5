@@ -1,0 +1,8 @@
+#!/bin/sh
+# Usage: sudo xfceproxy-add <id> <file.html | folder>   -> http://<id>.app.local/
+set -e
+[ $# -eq 2 ] || { echo "usage: xfceproxy-add <id> <file.html|folder>"; exit 1; }
+D=/usr/share/xfceproxy/webapps/$1
+mkdir -p "$D"
+if [ -d "$2" ]; then cp -r "$2"/. "$D"/; else cp "$2" "$D/index.html"; fi
+echo "Added: http://$1.app.local/"

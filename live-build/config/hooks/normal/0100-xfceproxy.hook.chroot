@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+useradd --system --no-create-home --shell /usr/sbin/nologin xfceproxy || true
+systemctl enable xfceproxy.service
+install -D -m 644 /usr/share/xshell/skel/profile /etc/skel/.profile
+install -D -m 644 /usr/share/xshell/skel/sway-config /etc/skel/.config/sway/config
+chmod 0440 /etc/sudoers.d/xshell
+echo work > /etc/xfceproxy/mode
+sed -i 's/Debian GNU\/Linux/EDUDB8OS/g; s/Debian/EDUDB8OS/g' /etc/calamares/branding/*/branding.desc 2>/dev/null || true

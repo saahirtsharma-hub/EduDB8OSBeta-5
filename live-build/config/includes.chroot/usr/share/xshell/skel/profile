@@ -1,0 +1,5 @@
+[ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+if [ -z "$WAYLAND_DISPLAY" ] && [ "$(tty)" = /dev/tty1 ]; then
+  export XDG_SESSION_TYPE=wayland MOZ_ENABLE_WAYLAND=1 WLR_RENDERER_ALLOW_SOFTWARE=1 WLR_NO_HARDWARE_CURSORS=1
+  exec sway
+fi

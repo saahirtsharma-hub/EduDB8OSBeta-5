@@ -1,0 +1,3 @@
+#!/bin/sh
+mkdir -p "$HOME/Pictures"
+exec grim "$HOME/Pictures/screenshot-$(date +%Y%m%d-%H%M%S).png"

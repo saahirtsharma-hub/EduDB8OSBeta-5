@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+lb config noauto \
+  --distribution trixie \
+  --architectures amd64 \
+  --binary-images iso-hybrid \
+  --bootloaders "grub-pc,grub-efi" \
+  --debian-installer none \
+  --archive-areas "main contrib non-free-firmware" \
+  --iso-application "EDUDB8OS" \
+  --iso-volume "EDUDB8OS" \
+  --bootappend-live "boot=live components quiet splash hostname=edudb8os username=user" \
+  --chroot-squashfs-compression-type zstd \
+  "${@}"

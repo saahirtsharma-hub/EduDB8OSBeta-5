@@ -1,0 +1,787 @@
+#!/usr/bin/env python3
+"""xshell-ui - the native (GTK) desktop shell for EDUDB8OS. It talks to the xshelld helper on 127.0.0.1."""
+import json, os, re, sys, threading, time, urllib.request
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk, Pango
+
+PORT = int(os.environ.get("XSHELL_PORT", "8081"))
+BASE = f"http://127.0.0.1:{PORT}"
+TOKFILE = os.environ.get("XSHELL_TOKEN", os.path.expanduser("~/.cache/xshell/token"))
+RED = "#ff3338"
+G = "linear-gradient(to right, #ff0f1f 0%, #2323ff 35%, #7f25ff 70%, #845040 100%)"
+WALLS = [G, "linear-gradient(to bottom right, #0f2027, #2c5364)", "linear-gradient(to bottom right, #ff512f, #dd2476)",
+         "linear-gradient(to bottom right, #134e5e, #71b280)", "linear-gradient(to bottom right, #0f0c29, #302b63, #24243e)"]
+SPECIAL = {"firefox": ("Firefox", "🦊"), "files": ("Files", "📁"), "foot": ("Terminal", ">_"), "store": ("App Store", "🛍"),
+           "tasks": ("Task Manager", "📊"), "settings": ("Settings", "⚙"), "notes": ("Notes", "📝"), "shot": ("Screenshot", "📸"),
+           "install": ("Install EDUDB8OS", "⭳")}
+WORK_WEB = [("Claude", "https://claude.ai"), ("Google", "https://www.google.com"), ("GitHub", "https://github.com"), ("Gmail", "https://mail.google.com"),
+            ("OneDrive", "https://onedrive.live.com"), ("Word", "https://word.cloud.microsoft"), ("Excel", "https://excel.cloud.microsoft"),
+            ("PowerPoint", "https://powerpoint.cloud.microsoft"), ("OneNote", "https://onenote.cloud.microsoft"), ("Outlook", "https://outlook.cloud.microsoft"),
+            ("Teams", "https://teams.cloud.microsoft"), ("Roblox", "https://www.roblox.com"), ("Gemini", "https://gemini.google.com"),
+            ("YouTube", "https://www.youtube.com"), ("My Webapps", "http://store.app.local/")]
+EDU_WEB = [("Scratch", "https://scratch.mit.edu"), ("PBS Kids", "https://pbskids.org"), ("Khan Academy", "https://www.khanacademy.org"),
+           ("Code.org", "https://code.org"), ("NatGeo Kids", "https://kids.nationalgeographic.com"), ("Wikipedia", "https://www.wikipedia.org")]
+WORK_PICKS = [("LibreOffice", "libreoffice"), ("VLC", "vlc"), ("GIMP", "gimp"), ("Thunderbird", "thunderbird"), ("Inkscape", "inkscape"),
+              ("Audacity", "audacity"), ("Chromium", "chromium")]
+EDU_PICKS = [("GCompris (learning games)", "gcompris-qt"), ("Tux Paint", "tuxpaint"), ("Tux Math", "tuxmath"), ("Tux Typing", "tuxtype"),
+             ("SuperTux (platform game)", "supertux")]
+DUP = re.compile(r"^(pcmanfm|firefox-esr|foot|footclient|foot-server)\.desktop$")
+SC = [1, 1, .87, .87, .75, .75, .6, .6]   # tiles shrink down the Apps menu, like the mockup
+V, HZ, CENTER, START, END = Gtk.Orientation.VERTICAL, Gtk.Orientation.HORIZONTAL, Gtk.Align.CENTER, Gtk.Align.START, Gtk.Align.END
+
+
+def api(path, **body):
+    for _ in range(2):
+        try:
+            with open(TOKFILE) as f:
+                tok = f.read().strip()
+            req = urllib.request.Request(BASE + path, json.dumps(body).encode(), {"X-Token": tok, "Origin": BASE, "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=1800) as r:
+                return json.load(r)
+        except Exception:
+            time.sleep(0.5)
+    return {}
+
+
+def bg(fn, cb=None):
+    def run():
+        try:
+            r = fn()
+        except Exception:
+            r = None
+        if cb:
+            GLib.idle_add(lambda: (cb(r), False)[1])
+    threading.Thread(target=run, daemon=True).start()
+
+
+def box(o=V, sp=8):
+    return Gtk.Box(orientation=o, spacing=sp)
+
+
+def lab(t, cls=None, wrap=True):
+    l = Gtk.Label(label=t)
+    l.set_xalign(0)
+    l.set_line_wrap(wrap)
+    if cls:
+        l.get_style_context().add_class(cls)
+    return l
+
+
+def btn(t, cb, cls="wbtn"):
+    b = Gtk.Button(label=t)
+    for c in cls.split():
+        b.get_style_context().add_class(c)
+    b.connect("clicked", lambda *_: cb())
+    return b
+
+
+def entry(ph="", secret=False, cb=None):
+    e = Gtk.Entry()
+    e.set_placeholder_text(ph)
+    e.set_visibility(not secret)
+    if cb:
+        e.connect("activate", lambda *_: cb())
+    return e
+
+
+def scrolled(child, maxh):
+    s = Gtk.ScrolledWindow()
+    s.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    s.set_propagate_natural_height(True)
+    s.set_max_content_height(maxh)
+    s.add(child)
+    return s
+
+
+def clear(c):
+    for ch in c.get_children():
+        c.remove(ch)
+
+
+class Shell(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="EDUDB8OS")
+        self.info = {"name": "", "mode": "work", "live": False}
+        self.wall, self.page, self.ppw, self.mtarget, self.task_timer, self.deb_ids, self.upd = 0, "", "", "edu", None, {}, {}
+        g = Gdk.Display.get_default().get_monitor(0).get_geometry()
+        self.W, self.H = g.width, g.height
+        self.css = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), self.css, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        self.apply_css()
+        self.fullscreen()
+        if os.environ.get("XSHELL_SHOT"):   # test harness: no window manager on the virtual screen
+            self.set_default_size(self.W, self.H)
+        self.connect("destroy", Gtk.main_quit)
+        self.connect("key-press-event", lambda w, e: self.close_panel() if e.keyval == Gdk.KEY_Escape else None)
+        ov = Gtk.Overlay()
+        self.add(ov)
+        ov.add(box())
+        self.pages = Gtk.Stack()
+        ov.add_overlay(self.pages)
+        self.build_setup()
+        self.build_lock()
+        self.pages.add_named(box(), "desk")
+        # top-right bar and status line
+        top = box(HZ, 8)
+        top.set_halign(END)
+        top.set_valign(START)
+        top.set_margin_top(12)
+        top.set_margin_end(14)
+        self.edu_lbl = lab("", "chip", False)
+        self.modebtn = btn("Work Mode", self.ask_mode, "chip")
+        self.parentbtn = btn("Parent", lambda: self.open_panel("parent"), "chip")
+        for w in (self.edu_lbl, self.modebtn, self.parentbtn, btn("⏻ Kill", lambda: bg(lambda: api("/api/kill")), "chip kill")):
+            top.pack_start(w, False, False, 0)
+        ov.add_overlay(top)
+        self.status = lab("", "msg", False)
+        self.status.set_halign(START)
+        self.status.set_valign(START)
+        self.status.set_margin_top(14)
+        self.status.set_margin_start(16)
+        ov.add_overlay(self.status)
+        # APPS button + panel
+        self.appsbtn = Gtk.Button(label="APPS\nClick\nHere")
+        self.appsbtn.get_style_context().add_class("apps")
+        self.appsbtn.get_child().set_justify(Gtk.Justification.CENTER)
+        self.appsbtn.set_halign(CENTER)
+        self.appsbtn.set_valign(END)
+        self.appsbtn.set_margin_bottom(40)
+        self.appsbtn.connect("clicked", lambda *_: self.open_panel("apps"))
+        ov.add_overlay(self.appsbtn)
+        self.panel = box()
+        self.panel.get_style_context().add_class("panel")
+        self.panel.set_halign(CENTER)
+        self.panel.set_valign(END)
+        self.panel.set_margin_bottom(170)
+        self.pst = Gtk.Stack()
+        self.panel.pack_start(self.pst, True, True, 0)
+        ov.add_overlay(self.panel)
+        mh = int(self.H * .6)
+        self.build_apps(mh)
+        self.build_store(mh)
+        self.build_tasks(mh)
+        self.build_settings(mh)
+        self.build_notes()
+        self.build_parent(mh)
+        self.build_mode()
+
+    # ---------- styling ----------
+    def apply_css(self):
+        h = self.H
+        css = f"""
+        window {{ background-image: {WALLS[self.wall]}; }}
+        label {{ color: #fff; }}
+        .clock {{ font-size: {int(h*.17)}px; font-weight: 800; color: {RED}; }}
+        .who {{ font-size: {int(h*.075)}px; font-weight: 800; color: #33b6a8; }}
+        .gbtn {{ background-image: {G}; color: #fff; border-radius: 16px; font-size: 22px; padding: 16px 40px; border: none; box-shadow: none; text-shadow: none; }}
+        .apps {{ background-image: none; background-color: {RED}; border-radius: 18px; border: none; box-shadow: none; padding: 14px 22px; }}
+        .apps label {{ color: #4a2bd9; font-size: 18px; }}
+        .panel {{ background-color: {RED}; border-radius: 18px; padding: 24px; }}
+        .tile {{ background-image: none; background-color: #000; border-radius: 20px; border: none; box-shadow: none; padding: 0; }}
+        .glyph {{ font-size: 26px; }} .cap {{ font-size: 10px; }}
+        .wbtn {{ background-image: none; background-color: #fff; border-radius: 10px; border: none; box-shadow: none; padding: 6px 14px; }}
+        .wbtn label {{ color: #000; font-weight: 600; }}
+        .chip {{ background-image: none; background-color: rgba(0,0,0,.6); border: 2px solid #000; border-radius: 10px; box-shadow: none; padding: 4px 12px; font-weight: 600; font-size: 13px; }}
+        .kill {{ background-color: #000; border-color: {RED}; }} .kill label {{ color: {RED}; }}
+        entry {{ background-color: #000; color: #fff; caret-color: #fff; border: none; border-radius: 12px; padding: 10px 12px; min-height: 24px; }}
+        textview, textview text {{ background-color: #000; color: #fff; }}
+        .h {{ font-size: 20px; font-weight: 700; }} .msg {{ font-size: 13px; }}
+        .wall {{ border-radius: 8px; border: 2px solid #fff; min-width: 44px; min-height: 30px; padding: 0; }}
+        """ + "".join(f".wall{i} {{ background-image: {w}; }}\n" for i, w in enumerate(WALLS))
+        self.css.load_from_data(css.encode())
+
+    # ---------- helpers ----------
+    def say(self, t, secs=6):
+        self.status.set_text(t)
+        if secs:
+            GLib.timeout_add_seconds(secs, lambda: (self.status.set_text("") if self.status.get_text() == t else None, False)[1])
+
+    def say_ts(self, t):
+        GLib.idle_add(lambda: (self.say(t, 0), False)[1])
+
+    def deb(self, key, fn):
+        if key in self.deb_ids:
+            GLib.source_remove(self.deb_ids[key])
+        self.deb_ids[key] = GLib.timeout_add(350, lambda: (fn(), False)[1])
+
+    def go(self, page):
+        self.page = page
+        self.pages.set_visible_child_name(page)
+        self.close_panel()
+        desk = page == "desk"
+        self.appsbtn.set_visible(desk)
+        self.modebtn.set_visible(desk)
+        self.parentbtn.set_visible(desk and self.info["mode"] == "edu")
+
+    def open_panel(self, name):
+        if self.panel.get_visible() and self.pst.get_visible_child_name() == name:
+            return self.close_panel()
+        self.pst.set_visible_child_name(name)
+        self.panel.show()
+        getattr(self, "on_" + name, lambda: None)()
+
+    def close_panel(self):
+        self.panel.hide()
+        self.ppw = ""
+
+    def apply_mode(self):
+        edu = self.info["mode"] == "edu"
+        self.modebtn.set_label("EDU Mode" if edu else "Work Mode")
+        self.parentbtn.set_visible(edu and self.page == "desk")
+        self.edu_lbl.set_visible(edu)
+        self.edu_tick()
+        self.refresh_apps()
+
+    def edu_tick(self):
+        if self.info["mode"] == "edu":
+            bg(lambda: api("/api/edu"), lambda r: r and self.edu_lbl.set_text(f"Firefox: {r['left']} min left today" if r.get("left") else "Firefox time is up for today"))
+        return True
+
+    # ---------- lock + setup ----------
+    def build_lock(self):
+        b = box(V, 0)
+        b.set_valign(START)
+        self.clock = lab("", "clock", False)
+        self.clock.set_halign(CENTER)
+        self.clock.set_margin_top(int(self.H * .05))
+        self.who = lab("", "who", False)
+        self.who.set_halign(CENTER)
+        self.who.set_margin_top(int(self.H * .07))
+        self.pwst = Gtk.Stack()
+        self.pwst.set_halign(CENTER)
+        self.pwst.set_margin_top(int(self.H * .05))
+        pb = btn("Enter Password", lambda: (self.pwst.set_visible_child_name("e"), self.pw.grab_focus()), "gbtn")
+        pb.set_size_request(max(360, int(self.W * .17)), 64)
+        self.pw = entry("Password", True, self.login)
+        self.pw.set_size_request(max(360, int(self.W * .17)), 60)
+        self.pwst.add_named(pb, "b")
+        self.pwst.add_named(self.pw, "e")
+        for w in (self.clock, self.who, self.pwst):
+            b.pack_start(w, False, False, 0)
+        self.pages.add_named(b, "lock")
+        self.tick()
+        GLib.timeout_add_seconds(10, self.tick)
+
+    def tick(self):
+        t = time.localtime()
+        self.clock.set_text(f"{t.tm_hour % 12 or 12}:{t.tm_min:02d}")
+        return True
+
+    def login(self):
+        pw = self.pw.get_text()
+        bg(lambda: api("/api/login", password=pw), lambda r: self.unlock() if r and r.get("ok") else (self.pw.set_text(""), self.pw.set_placeholder_text("Wrong password, try again")))
+
+    def unlock(self):
+        self.pw.set_text("")
+        self.pwst.set_visible_child_name("b")
+        self.go("desk")
+
+    def build_setup(self):
+        card = box(V, 8)
+        card.get_style_context().add_class("panel")
+        card.set_halign(CENTER)
+        card.set_valign(CENTER)
+        card.set_size_request(min(520, int(self.W * .9)), -1)
+        st = Gtk.Stack()
+        s1 = box(V, 8)
+        s1.pack_start(lab("Set up EDUDB8OS", "h"), False, False, 0)
+        s1.pack_start(lab("Choose the name and password you will sign in with, and a mode."), False, False, 0)
+        self.sn, self.sp, self.sc = entry("Your name"), entry("Password", True), entry("Confirm password", True)
+        for w in (self.sn, self.sp, self.sc):
+            s1.pack_start(w, False, False, 0)
+        self.r_work = Gtk.RadioButton.new_with_label_from_widget(None, "Work Mode: all productivity features, terminal and the full app store")
+        self.r_edu = Gtk.RadioButton.new_with_label_from_widget(self.r_work, "EDU Mode: for kids. Games and learning apps only, no terminal, Firefox limited to 45 minutes a day, approved websites only")
+        for r in (self.r_work, self.r_edu):
+            r.get_child().set_line_wrap(True)
+            s1.pack_start(r, False, False, 0)
+        self.m1 = lab("", "msg")
+        s1.pack_start(self.m1, False, False, 0)
+        s1.pack_start(btn("Continue", self.setup_next), False, False, 0)
+        s2 = box(V, 8)
+        s2.pack_start(lab("Choose your apps", "h"), False, False, 0)
+        s2.pack_start(lab("Picked apps install in the background and appear in the Apps menu."), False, False, 0)
+        self.picks = box(V, 4)
+        s2.pack_start(self.picks, False, False, 0)
+        self.m2 = lab("", "msg")
+        s2.pack_start(self.m2, False, False, 0)
+        s2.pack_start(btn("Finish setup", self.setup_done), False, False, 0)
+        st.add_named(s1, "1")
+        st.add_named(s2, "2")
+        self.setup_stack = st
+        card.pack_start(st, True, True, 0)
+        self.pages.add_named(card, "setup")
+
+    def setup_next(self):
+        if self.sp.get_text() != self.sc.get_text():
+            return self.m1.set_text("The passwords do not match.")
+        if not self.sn.get_text().strip() or len(self.sp.get_text()) < 4:
+            return self.m1.set_text("Enter a name and a password of 4 or more characters.")
+        clear(self.picks)
+        edu = self.r_edu.get_active()
+        for label, pkg in (EDU_PICKS if edu else WORK_PICKS):
+            c = Gtk.CheckButton(label=label)
+            c.set_active(edu)
+            c.pkg = pkg
+            self.picks.pack_start(c, False, False, 0)
+        self.picks.show_all()
+        self.setup_stack.set_visible_child_name("2")
+
+    def setup_done(self):
+        name, pw, mode = self.sn.get_text().strip(), self.sp.get_text(), "edu" if self.r_edu.get_active() else "work"
+        picks = [(c.get_label(), c.pkg) for c in self.picks.get_children() if c.get_active()]
+
+        def done(r):
+            if not (r and r.get("ok")):
+                return self.m2.set_text("Setup failed. Use a name with letters or numbers, and a password of 4 or more characters.")
+            self.info.update(name=name, mode=mode)
+            self.who.set_text(name)
+            self.sp.set_text("")
+            self.sc.set_text("")
+            self.go("lock")
+            self.apply_mode()
+            self.install_all(picks)
+        bg(lambda: api("/api/setup", name=name, password=pw, mode=mode), done)
+
+    def install_all(self, picks):
+        if not picks:
+            return
+
+        def run():
+            self.say_ts("Getting ready to install apps…")
+            api("/api/refresh")
+            for i, (label, pkg) in enumerate(picks, 1):
+                self.say_ts(f"Installing {label} ({i} of {len(picks)})…")
+                api("/api/install", pkg=pkg)
+                GLib.idle_add(lambda: (self.refresh_apps(), False)[1])
+            self.say_ts("Apps installed. Open the Apps menu to find them.")
+        threading.Thread(target=run, daemon=True).start()
+
+    # ---------- apps menu ----------
+    def build_apps(self, mh):
+        self.apps_box = box(V, 12)
+        self.pst.add_named(scrolled(self.apps_box, mh), "apps")
+
+    def refresh_apps(self):
+        edu = self.info["mode"] == "edu"
+        order = ["firefox", "files"] + ([] if edu else ["foot"]) + ["store", "tasks", "settings"] + ([] if edu else ["notes", "shot"])
+        if self.info.get("live") and not edu:
+            order.append("install")
+        sp = [{"name": SPECIAL[k][0], "glyph": SPECIAL[k][1], "act": k} for k in order]
+        web = [{"name": n, "url": u} for n, u in (EDU_WEB if edu else WORK_WEB)]
+
+        def fill(r):
+            apps = [a for a in (r if isinstance(r, list) else []) if not DUP.match(a["id"])]
+            entries = sp + apps + web
+            clear(self.apps_box)
+            for i in range(0, len(entries), 4):
+                s = SC[min(i // 4, 7)]
+                row = box(HZ, 12)
+                row.set_halign(CENTER)
+                for e in entries[i:i + 4]:
+                    row.pack_start(self.tile(e, s), False, False, 0)
+                self.apps_box.pack_start(row, False, False, 0)
+            self.apps_box.show_all()
+        bg(lambda: api("/api/apps"), fill)
+
+    def tile(self, e, s):
+        w, h = int(83 * s), int(109 * s)
+        b = Gtk.Button()
+        b.get_style_context().add_class("tile")
+        b.set_size_request(w, h)
+        v = box(V, 2)
+        v.set_valign(CENTER)
+        g = lab(e.get("glyph") or e["name"][:1], "glyph", False)
+        g.set_halign(CENTER)
+        v.pack_start(g, False, False, 0)
+        if s >= .87:
+            c = lab(e["name"], "cap", False)
+            c.set_ellipsize(Pango.EllipsizeMode.END)
+            c.set_max_width_chars(10)
+            c.set_halign(CENTER)
+            v.pack_start(c, False, False, 0)
+        b.add(v)
+        b.set_tooltip_text(e["name"])
+        b.connect("clicked", lambda *_: self.launch(e))
+        b.connect("enter-notify-event", lambda *_: b.set_size_request(83, 109))
+        b.connect("leave-notify-event", lambda *_: b.set_size_request(w, h))
+        return b
+
+    def launch(self, e):
+        if "act" in e:
+            return self.act(e["act"])
+        self.close_panel()
+        body = {"id": e["id"]} if "id" in e else {"url": e["url"]}
+        bg(lambda: api("/api/launch", **body), lambda r: r and r.get("msg") and self.say(r["msg"]))
+
+    def act(self, t):
+        if t in ("store", "tasks", "settings", "notes"):
+            return self.open_panel(t)
+        self.close_panel()
+        if t == "shot":
+            return bg(lambda: api("/api/screenshot"), lambda r: self.say("Screenshot saved in Pictures." if r and r.get("ok") else "Screenshot failed."))
+        body = {"cmd": t} if t in ("foot", "files", "install") else {"url": ""}
+        bg(lambda: api("/api/launch", **body), lambda r: r and r.get("msg") and self.say(r["msg"]))
+
+    # ---------- app store ----------
+    def build_store(self, mh):
+        b = box(V, 8)
+        b.pack_start(lab("App Store", "h"), False, False, 0)
+        self.sq = entry("Search apps and press Enter", False, self.search)
+        b.pack_start(self.sq, False, False, 0)
+        self.sres = box(V, 6)
+        b.pack_start(scrolled(self.sres, int(mh * .7)), False, False, 0)
+        self.updated_lists = False
+        self.pst.add_named(b, "store")
+
+    def on_store(self):
+        edu = self.info["mode"] == "edu"
+        self.sq.set_placeholder_text("Search kids apps" if edu else "Search apps and press Enter")
+        if not self.updated_lists:
+            self.updated_lists = True
+            clear(self.sres)
+            self.sres.pack_start(lab("Updating package lists…", "msg"), False, False, 0)
+            self.sres.show_all()
+            bg(lambda: api("/api/refresh"), lambda r: self.search() if edu else (clear(self.sres), self.sres.pack_start(lab("Type a name and press Enter.", "msg"), False, False, 0), self.sres.show_all()))
+        elif edu:
+            self.search()
+        self.sq.grab_focus()
+
+    def search(self):
+        q = self.sq.get_text()
+        bg(lambda: api("/api/search", q=q), self.show_results)
+
+    def show_results(self, r):
+        clear(self.sres)
+        r = r if isinstance(r, list) else []
+        for p in r:
+            row = box(HZ, 8)
+            row.pack_start(lab(f"{p['name']}\n{p['desc']}", "msg"), True, True, 0)
+            b = Gtk.Button(label="Install")
+            b.get_style_context().add_class("wbtn")
+            b.connect("clicked", lambda w, n=p["name"]: self.install_one(w, n))
+            row.pack_end(b, False, False, 0)
+            self.sres.pack_start(row, False, False, 0)
+        if not r:
+            self.sres.pack_start(lab("No apps found.", "msg"), False, False, 0)
+        self.sres.show_all()
+
+    def install_one(self, w, name):
+        w.set_label("Installing…")
+        w.set_sensitive(False)
+        bg(lambda: api("/api/install", pkg=name), lambda r: (w.set_label("Installed" if r and r.get("ok") else "Failed"), self.refresh_apps()))
+
+    # ---------- task manager ----------
+    def build_tasks(self, mh):
+        b = box(V, 8)
+        b.pack_start(lab("Task Manager", "h"), False, False, 0)
+        self.tsum = lab("", "msg")
+        b.pack_start(self.tsum, False, False, 0)
+        self.trows = Gtk.Grid(column_spacing=14, row_spacing=6)
+        b.pack_start(scrolled(self.trows, int(mh * .7)), False, False, 0)
+        self.pst.add_named(b, "tasks")
+
+    def on_tasks(self):
+        self.tasks_tick()
+        if not self.task_timer:
+            self.task_timer = GLib.timeout_add(2000, self.tasks_tick)
+
+    def tasks_tick(self):
+        if not (self.panel.get_visible() and self.pst.get_visible_child_name() == "tasks"):
+            self.task_timer = None
+            return False
+        bg(lambda: api("/api/tasks"), self.show_tasks)
+        return True
+
+    def show_tasks(self, r):
+        if not r or "rows" not in r:
+            return
+        self.tsum.set_text(f"CPU {r['cpu']}%   Memory {r['used']} of {r['total']} MB")
+        clear(self.trows)
+        for i, p in enumerate(r["rows"]):
+            n = lab(p["name"], None, False)
+            n.set_max_width_chars(22)
+            n.set_ellipsize(Pango.EllipsizeMode.END)
+            self.trows.attach(n, 0, i, 1, 1)
+            col = 1
+            if not r["edu"]:
+                self.trows.attach(lab(f"{p['cpu']}%", None, False), 1, i, 1, 1)
+                col = 2
+            self.trows.attach(lab(f"{p['mem']} MB", None, False), col, i, 1, 1)
+            if not p["locked"]:
+                self.trows.attach(btn("End", lambda pid=p["pid"]: bg(lambda: api("/api/tasks/end", pid=pid))), col + 1, i, 1, 1)
+        if not r["rows"]:
+            self.trows.attach(lab("No open apps.", None, False), 0, 0, 1, 1)
+        self.trows.show_all()
+
+    # ---------- settings (mode toggle needs the password every time) ----------
+    def build_settings(self, mh):
+        b = box(V, 10)
+        b.pack_start(lab("Settings", "h"), False, False, 0)
+        self.set_mode_lbl = lab("", None)
+        b.pack_start(self.set_mode_lbl, False, False, 0)
+        self.set_mode_btn = btn("", self.ask_mode)
+        b.pack_start(self.set_mode_btn, False, False, 0)
+        b.pack_start(lab("Wi-Fi"), False, False, 0)
+        self.wifi_c = Gtk.ComboBoxText()
+        self.wifi_pw = entry("Wi-Fi password (if any)", True)
+        b.pack_start(self.wifi_c, False, False, 0)
+        b.pack_start(self.wifi_pw, False, False, 0)
+        b.pack_start(btn("Connect", self.wifi_connect), False, False, 0)
+        self.vol = Gtk.Scale.new_with_range(HZ, 0, 100, 1)
+        self.bri = Gtk.Scale.new_with_range(HZ, 5, 100, 1)
+        for lbl, sc, url in (("Sound", self.vol, "/api/volume"), ("Brightness", self.bri, "/api/brightness")):
+            sc.set_draw_value(False)
+            sc.connect("value-changed", lambda s, u=url: None if getattr(self, "_loading", False) else self.deb(u, lambda: bg(lambda: api(u, set=int(s.get_value())))))
+            b.pack_start(lab(lbl), False, False, 0)
+            b.pack_start(sc, False, False, 0)
+        b.pack_start(lab("Wallpaper"), False, False, 0)
+        wr = box(HZ, 6)
+        for i in range(len(WALLS)):
+            w = Gtk.Button()
+            w.get_style_context().add_class("wall")
+            w.get_style_context().add_class(f"wall{i}")
+            w.connect("clicked", lambda _w, i=i: self.set_wall(i))
+            wr.pack_start(w, False, False, 0)
+        b.pack_start(wr, False, False, 0)
+        self.upd_lbl = lab("", "msg")
+        b.pack_start(self.upd_lbl, False, False, 0)
+        self.upd_btn = btn("Check for updates", self.update_click)
+        b.pack_start(self.upd_btn, False, False, 0)
+        self.pst.add_named(scrolled(b, int(mh * .85)), "settings")
+
+    def on_settings(self):
+        other = "EDU" if self.info["mode"] == "work" else "Work"
+        self.set_mode_lbl.set_text(f"Current mode: {'EDU' if self.info['mode'] == 'edu' else 'Work'} Mode")
+        self.set_mode_btn.set_label(f"Switch to {other} Mode (asks for your password)")
+
+        def fill(t):
+            vol, bri, wifi, upd = t
+            self._loading = True
+            for sc, r in ((self.vol, vol), (self.bri, bri)):
+                v = r.get("value") if isinstance(r, dict) else None
+                sc.set_sensitive(v is not None)
+                if v is not None:
+                    sc.set_value(v)
+            self._loading = False
+            self.wifi_c.remove_all()
+            for n in (wifi if isinstance(wifi, list) else []):
+                self.wifi_c.append_text(n["ssid"])
+            self.wifi_c.set_active(0)
+            self.show_upd(upd)
+        bg(lambda: (api("/api/volume"), api("/api/brightness"), api("/api/wifi/list"), api("/api/update/check")), lambda t: t and fill(t))
+
+    def wifi_connect(self):
+        ssid, pw = self.wifi_c.get_active_text(), self.wifi_pw.get_text()
+        if ssid:
+            bg(lambda: api("/api/wifi/connect", ssid=ssid, password=pw), lambda r: self.say(f"Connected to {ssid}" if r and r.get("ok") else "Could not connect. Check the password."))
+
+    def set_wall(self, i):
+        self.wall = i
+        self.apply_css()
+        bg(lambda: api("/api/prefs/set", wallpaper=i))
+
+    def show_upd(self, r):
+        self.upd = r if isinstance(r, dict) else {}
+        if self.upd.get("available"):
+            self.upd_lbl.set_text(f"Update available: version {self.upd['remote']} (you have {self.upd['local']})")
+            self.upd_btn.set_label("Install update")
+        elif self.upd.get("remote") is None and "local" in self.upd:
+            self.upd_lbl.set_text(f"Version {self.upd['local']}. Could not reach updates. Is the repo public?")
+            self.upd_btn.set_label("Check for updates")
+        else:
+            self.upd_lbl.set_text(f"Version {self.upd.get('local', '?')}. You are up to date.")
+            self.upd_btn.set_label("Check for updates")
+
+    def update_click(self):
+        if not self.upd.get("available"):
+            return bg(lambda: api("/api/update/check"), self.show_upd)
+        self.say("Downloading update…", 0)
+
+        def done(r):
+            if r and r.get("ok"):
+                self.say("Updated. Restarting the shell…", 0)
+                GLib.timeout_add_seconds(2, self.restart)
+            else:
+                self.say((r or {}).get("msg", "Update failed."))
+        bg(lambda: api("/api/update/install"), done)
+
+    def restart(self):
+        def wait():
+            for _ in range(40):
+                try:
+                    urllib.request.urlopen(BASE + "/health", timeout=1)
+                    break
+                except Exception:
+                    time.sleep(0.5)
+            GLib.idle_add(lambda: os.execv(sys.executable, [sys.executable] + sys.argv))
+        threading.Thread(target=wait, daemon=True).start()
+        return False
+
+    # ---------- switch mode: password every time ----------
+    def build_mode(self):
+        b = box(V, 8)
+        self.mhead = lab("", "h")
+        b.pack_start(self.mhead, False, False, 0)
+        b.pack_start(lab("Enter the admin password to switch. It is asked every time."), False, False, 0)
+        self.mpw = entry("Admin password", True, self.mode_go)
+        b.pack_start(self.mpw, False, False, 0)
+        self.mmsg = lab("", "msg")
+        b.pack_start(self.mmsg, False, False, 0)
+        row = box(HZ, 8)
+        row.pack_start(btn("Switch", self.mode_go), False, False, 0)
+        row.pack_start(btn("Cancel", self.close_panel), False, False, 0)
+        b.pack_start(row, False, False, 0)
+        self.pst.add_named(b, "mode")
+
+    def ask_mode(self):
+        self.mtarget = "edu" if self.info["mode"] == "work" else "work"
+        self.mhead.set_text(f"Switch to {'EDU' if self.mtarget == 'edu' else 'Work'} Mode")
+        self.mpw.set_text("")
+        self.mmsg.set_text("")
+        self.open_panel("mode")
+        self.mpw.grab_focus()
+
+    def mode_go(self):
+        pw, target = self.mpw.get_text(), self.mtarget
+        self.mpw.set_text("")
+
+        def done(r):
+            if not (r and r.get("ok")):
+                return self.mmsg.set_text("Wrong password.")
+            self.info["mode"] = target
+            self.close_panel()
+            self.apply_mode()
+            self.say(f"Switched to {'EDU' if target == 'edu' else 'Work'} Mode.")
+        bg(lambda: api("/api/mode", mode=target, password=pw), done)
+
+    # ---------- notes ----------
+    def build_notes(self):
+        b = box(V, 8)
+        b.pack_start(lab("Notes", "h"), False, False, 0)
+        self.tv = Gtk.TextView()
+        self.tv.set_wrap_mode(Gtk.WrapMode.WORD)
+        self.tv.set_size_request(400, 220)
+        self.nbuf = self.tv.get_buffer()
+        self.nbuf.connect("changed", lambda *_: None if getattr(self, "_nload", False) else self.deb("notes", self.save_notes))
+        b.pack_start(self.tv, False, False, 0)
+        self.pst.add_named(b, "notes")
+
+    def on_notes(self):
+        def fill(r):
+            self._nload = True
+            self.nbuf.set_text((r or {}).get("text", ""))
+            self._nload = False
+        bg(lambda: api("/api/notes"), fill)
+
+    def save_notes(self):
+        t = self.nbuf.get_text(self.nbuf.get_start_iter(), self.nbuf.get_end_iter(), False)
+        bg(lambda: api("/api/notes/save", text=t))
+
+    # ---------- parent controls (EDU) ----------
+    def build_parent(self, mh):
+        b = box(V, 8)
+        b.pack_start(lab("Parent controls", "h"), False, False, 0)
+        self.pgate = box(V, 8)
+        self.ppwe = entry("Admin password", True, self.parent_unlock)
+        self.pmsg = lab("", "msg")
+        for w in (lab("Enter the admin password."), self.ppwe, self.pmsg, btn("Unlock", self.parent_unlock)):
+            self.pgate.pack_start(w, False, False, 0)
+        self.pbody = box(V, 8)
+        b.pack_start(self.pgate, False, False, 0)
+        b.pack_start(scrolled(self.pbody, int(mh * .7)), False, False, 0)
+        self.pst.add_named(b, "parent")
+
+    def on_parent(self):
+        self.ppw = ""
+        self.ppwe.set_text("")
+        self.pmsg.set_text("")
+        self.pgate.show_all()
+        clear(self.pbody)
+        self.ppwe.grab_focus()
+
+    def pcall(self, action, value=None, cb=None):
+        pw = self.ppw
+        bg(lambda: api("/api/parent", password=pw, action=action, value=value), cb)
+
+    def parent_unlock(self):
+        self.ppw = self.ppwe.get_text()
+        self.ppwe.set_text("")
+
+        def done(r):
+            if not (r and r.get("ok")):
+                self.ppw = ""
+                return self.pmsg.set_text("Wrong password.")
+            self.pgate.hide()
+            self.parent_show(r)
+        self.pcall("get", None, done)
+
+    def parent_show(self, r):
+        clear(self.pbody)
+        self.pbody.pack_start(lab(f"Today: {r['used']} of {r['limit']} minutes of Firefox used."), False, False, 0)
+        spin = Gtk.SpinButton.new_with_range(5, 180, 5)
+        spin.set_value(r["limit"])
+        self.pbody.pack_start(lab("Daily Firefox minutes"), False, False, 0)
+        self.pbody.pack_start(spin, False, False, 0)
+        self.pbody.pack_start(btn("Save time limit", lambda: self.pcall("limit", spin.get_value_as_int(), self.parent_after)), False, False, 0)
+        self.pbody.pack_start(lab("Allowed websites (the built-in kids list is always allowed)"), False, False, 0)
+        for s in r["sites"]:
+            row = box(HZ, 8)
+            row.pack_start(lab(s, None, False), True, True, 0)
+            row.pack_end(btn("Remove", lambda s=s: self.pcall("remove", s, self.parent_after)), False, False, 0)
+            self.pbody.pack_start(row, False, False, 0)
+        new = entry("example.com")
+        self.pbody.pack_start(new, False, False, 0)
+        self.pbody.pack_start(btn("Allow this website", lambda: self.pcall("add", new.get_text(), self.parent_after)), False, False, 0)
+        self.pbody.show_all()
+
+    def parent_after(self, r):
+        if r and r.get("ok"):
+            self.apply_mode()
+            self.parent_show(r)
+        else:
+            self.say("That did not work. Check the value and try again.")
+
+    # ---------- start ----------
+    def start(self):
+        def got(r):
+            if not r or "mode" not in r:
+                return GLib.timeout_add_seconds(1, lambda: (self.start(), False)[1]) and None
+            self.info.update(name=r.get("name") or "", mode=r.get("mode", "work"), live=bool(r.get("live")))
+            self.who.set_text(self.info["name"])
+            self.apply_mode()
+            self.go("lock" if self.info["name"] else "setup")
+            if os.environ.get("XSHELL_AUTOUNLOCK") and self.info["name"]:
+                self.unlock()
+            if os.environ.get("XSHELL_PANEL"):
+                GLib.timeout_add(900, lambda: (self.open_panel(os.environ["XSHELL_PANEL"]), False)[1])
+        bg(lambda: api("/api/account"), got)
+        GLib.timeout_add_seconds(30, self.edu_tick)
+        bg(lambda: api("/api/prefs"), lambda p: p and isinstance(p.get("wallpaper"), int) and self.set_wall_local(p["wallpaper"]))
+        if os.environ.get("XSHELL_SHOT"):
+            GLib.timeout_add(4500, self.shot)
+
+    def set_wall_local(self, i):
+        self.wall = i
+        self.apply_css()
+
+    def shot(self):
+        w = self.get_window()
+        pb = Gdk.pixbuf_get_from_window(w, 0, 0, w.get_width(), w.get_height())
+        pb.savev(os.environ["XSHELL_SHOT"], "png", [], [])
+        Gtk.main_quit()
+        return False
+
+
+def main():
+    GLib.set_prgname("xshell")
+    win = Shell()
+    win.show_all()
+    win.go("lock")
+    win.start()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

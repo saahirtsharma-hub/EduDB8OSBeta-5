@@ -1,0 +1,13 @@
+{
+  "policies": {
+    "Proxy": {
+      "Mode": "manual",
+      "Locked": true,
+      "HTTPProxy": "127.0.0.1:8080",
+      "UseHTTPProxyForAllProtocols": true,
+      "Passthrough": "localhost,127.0.0.1"
+    },
+    "Homepage": { "URL": "http://home.app.local/", "StartPage": "homepage" },
+    "DisableTelemetry": true
+  }
+}
